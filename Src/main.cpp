@@ -33,7 +33,48 @@ static std::string moduleNameFromInterface(const std::string& interfaceName) {
     return interfaceName.substr(0, dotPos);
 }
 
-void run(OutputLanguage language, const std::string& outputDir, const std::vector<std::string>& inputDirs, std::optional<bool> enableExceptions, std::string inInterfaceName, std::string outInterfaceName) {
+static std::size_t writeOutMethods(std::shared_ptr<InterfaceType> type, std::shared_ptr<CppCodeFile> file) {
+    std::size_t offset = 0;
+    if (type->baseInterfaceType->type->name != "LFramework::IUnknown") {
+        offset = writeOutMethods(std::dynamic_pointer_cast<InterfaceType>(type->baseInterfaceType->type), file);
+    }
+
+    for (std::size_t i = 0; i < type->methods.size(); ++i) {
+        auto method = type->methods[i];
+
+        auto globalMethodId = offset + i;
+        file->write("void ").write(method.name).write("(");
+        for (int j = 0; j < method.args.size(); ++j) {
+            auto arg = method.args[j];
+            file->write(file->fullName(arg.type)).write(" ").write(arg.name);
+            if (1 < method.args.size() - 1) {
+                file->write(", ");
+            }
+        }
+        file->write(")");
+
+
+        file->beginScope(method.name);
+        file->write("//PacketID: ").writeLine(std::to_string(globalMethodId));
+
+        file->writeLine("MicroNetwork::Common::PacketHeader header;");
+        file->writeLine("header.id = " + std::to_string(globalMethodId) + ";");
+
+        file->writeLine("header.size = sizeof(" + file->fullName(method.args[0].type) + ");");
+
+        file->writeLine("_next->packet(header, &" + method.args[0].name + ");");
+
+      /*
+       
+        _next->packet(header, &request);*/
+
+        file->endScope();
+    }
+
+    return offset + type->methods.size();
+}
+
+void run(OutputLanguage language, const std::string& outputDir, const std::vector<std::string>& inputDirs, std::optional<bool> enableExceptions, std::string targetInterfaceName, bool isOutMarshaling) {
    
 
     TypeCache::init();
@@ -41,23 +82,24 @@ void run(OutputLanguage language, const std::string& outputDir, const std::vecto
         TypeCache::addSearchPath(dir);
     }
 
-    auto inModuleName = moduleNameFromInterface(inInterfaceName);
-    auto outModuleName = moduleNameFromInterface(outInterfaceName);
+    auto targetModuleName = moduleNameFromInterface(targetInterfaceName);
 
-    auto inModule = TypeCache::parseModule(inModuleName);
-    auto outModule = TypeCache::parseModule(outModuleName);
+    auto shortInterfaceName = targetInterfaceName.substr(targetModuleName.size() + 1);
+
+    auto targetModule = TypeCache::parseModule(targetModuleName);
+
+    auto commonModule = TypeCache::parseModule("MicroNetwork.Common");
 
    /* for (auto& module : modules) {
         TypeCache::parseModule(module);
     }*/
 
+    std::string suffix = (isOutMarshaling ? std::string("Out") : std::string("In")) + "Marshaler";
 
     auto resultModule = std::make_shared<Module>();
-    resultModule->name = inModuleName + ".HostDeviceInterop";
-    resultModule->importedTypes.insert(resultModule->importedTypes.end(), inModule->importedTypes.begin(), inModule->importedTypes.end());
-    if (outModule != inModule) {
-        resultModule->importedTypes.insert(resultModule->importedTypes.end(), outModule->importedTypes.begin(), outModule->importedTypes.end());
-    }
+    resultModule->name = targetInterfaceName + "." + suffix;
+    resultModule->importedTypes.insert(resultModule->importedTypes.end(), targetModule->importedTypes.begin(), targetModule->importedTypes.end());
+   
    
 
     auto parsedModules = TypeCache::getModules();
@@ -68,8 +110,66 @@ void run(OutputLanguage language, const std::string& outputDir, const std::vecto
             generator.enableExceptions = enableExceptions.value();
         }
       
-        auto codeFile = generator.createCodeFile(); 
+
+        auto itf =  targetModule->findType(shortInterfaceName);
+
+        auto idatareceiver = commonModule->findType("IDataReceiver");
+
+        resultModule->importedTypes.push_back(itf);
+        resultModule->importedTypes.push_back(idatareceiver);
+
+        auto codeFile = std::static_pointer_cast<CppCodeFile>( generator.createCodeFile()); 
         codeFile->writeModule(resultModule, false);
+
+        codeFile->beginNamespaceScope(targetModule->name);
+
+        std::string marshalerName = shortInterfaceName + suffix;
+
+        //: public LFramework::ComImplement<IHostToDeviceMarshaler, LFramework::ComObject, MicroNetwork::Task::MemoryAccess::IHostToDevice> {
+        codeFile->write("class ").write(marshalerName).write(" : public LFramework::ComImplement<").write(marshalerName).write(", LFramework::ComObject, ").write(codeFile->fullName(itf)).write(">");
+        codeFile->beginScope(marshalerName);
+
+
+        codeFile->unident().write("public:").ident().writeLine();
+
+
+        auto itfType = std::dynamic_pointer_cast<InterfaceType>(itf->type);
+        
+        writeOutMethods(itfType, codeFile);
+    
+        codeFile->unident().write("protected:").ident().writeLine();
+        codeFile->writeLine("LFramework::ComPtr<MicroNetwork::Common::IDataReceiver>  _next;");
+        
+
+        codeFile->endScope(";");
+        codeFile->endScope();
+
+        /*
+        class IHostToDeviceMarshaler : public LFramework::ComImplement<IHostToDeviceMarshaler, LFramework::ComObject, MicroNetwork::Task::MemoryAccess::IHostToDevice> {
+public:
+    IHostToDeviceMarshaler(LFramework::ComPtr<MicroNetwork::Common::IDataReceiver> next) : _next(next) {
+        
+    }
+    void read(MicroNetwork::Task::MemoryAccess::MemoryRegion request) {
+        MicroNetwork::Common::PacketHeader header;
+        header.id = 0;
+        header.size = sizeof(MicroNetwork::Task::MemoryAccess::MemoryRegion);
+        _next->packet(header, &request);
+    }
+    void write(MicroNetwork::Task::MemoryAccess::MemoryBlob request) {
+        MicroNetwork::Common::PacketHeader header;
+        header.id = 1;
+        header.size = sizeof(MicroNetwork::Task::MemoryAccess::MemoryBlob);
+        _next->packet(header, &request);
+    }
+protected:
+    LFramework::ComPtr<MicroNetwork::Common::IDataReceiver> _next;
+};
+
+
+*/
+       // codeFile->wr
+
         generator.saveCodeFile(outputDir, resultModule->name, codeFile);
        // generator.generate(outputDir);
     }else{
@@ -85,8 +185,8 @@ int main(int argc, const char* const* argv) {
         auto outputDir = CommandLine::OptionDescription("--output", "Output files directory", CommandLine::OptionType::SingleValue).alias("-o");
         auto inputDirs = CommandLine::OptionDescription("--input",  "Input files directory", CommandLine::OptionType::MultipleValues).alias("-I");
 
-        auto inInterface = CommandLine::OptionDescription("--in", "IN interface", CommandLine::OptionType::SingleValue);
-        auto outInterface = CommandLine::OptionDescription("--out", "OUT interface", CommandLine::OptionType::SingleValue);
+        auto targetInterface = CommandLine::OptionDescription("--target", "IN interface", CommandLine::OptionType::SingleValue);
+        auto isOutDirection = CommandLine::OptionDescription("--out", "Is OUT direction marshaling (to network)", CommandLine::OptionType::NoValue);
 
         CommandLine::Command app("TaskApiGenerator", "Generate Task API implementation helpers for MicroNetwork from .cidl files", [&](CommandLine::Command& cmd) {
             cmd.addHelpOption();
@@ -106,11 +206,11 @@ int main(int argc, const char* const* argv) {
             auto& inputDirsOpt = cmd.option(inputDirs);
             auto& exceptionsOpt = cmd.option(exceptions);
 
-            auto& inInterfaceOpt = cmd.option(inInterface);
-            auto& outInterfaceOpt = cmd.option(outInterface);
+            auto& targetInterfaceOpt = cmd.option(targetInterface);
+            auto& isOutDirectionOpt = cmd.option(isOutDirection);
 
             cmd.handler([&]() {
-                run(languageOpt.value<OutputLanguage>(), outputDirOpt.value(), inputDirsOpt.values(), exceptionsOpt.valueOptional<bool>(), inInterfaceOpt.value(), outInterfaceOpt.value());
+                run(languageOpt.value<OutputLanguage>(), outputDirOpt.value(), inputDirsOpt.values(), exceptionsOpt.valueOptional<bool>(), targetInterfaceOpt.value(), isOutDirectionOpt.isSet());
             });
         });
 
