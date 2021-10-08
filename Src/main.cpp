@@ -52,126 +52,151 @@ static std::size_t writeOutMethods(std::shared_ptr<InterfaceType> type, std::sha
             }
         }
         file->write(")");
-
-
         file->beginScope(method.name);
         file->write("//PacketID: ").writeLine(std::to_string(globalMethodId));
-
         file->writeLine("MicroNetwork::Common::PacketHeader header;");
         file->writeLine("header.id = " + std::to_string(globalMethodId) + ";");
-
         file->writeLine("header.size = sizeof(" + file->fullName(method.args[0].type) + ");");
-
         file->writeLine("_next->packet(header, &" + method.args[0].name + ");");
-
-      /*
-       
-        _next->packet(header, &request);*/
-
         file->endScope();
     }
-
     return offset + type->methods.size();
 }
 
-void run(OutputLanguage language, const std::string& outputDir, const std::vector<std::string>& inputDirs, std::optional<bool> enableExceptions, std::string targetInterfaceName, bool isOutMarshaling) {
-   
 
+
+static std::size_t writeInMethods(std::shared_ptr<InterfaceType> type, std::shared_ptr<CppCodeFile> file) {
+    std::size_t offset = 0;
+    if (type->baseInterfaceType->type->name != "LFramework::IUnknown") {
+        offset = writeInMethods(std::dynamic_pointer_cast<InterfaceType>(type->baseInterfaceType->type), file);
+    }
+
+    for (std::size_t i = 0; i < type->methods.size(); ++i) {
+        auto method = type->methods[i];
+        auto globalMethodId = offset + i;
+        file->unident().write("case ").write(std::to_string(globalMethodId)).ident().writeLine(":");
+        file->write("_next->").write(method.name).write("(");
+        if (!method.args.empty()) {
+            file->write("*(reinterpret_cast<const ").write(file->fullName(method.args[0].type)).write("*>(data))");
+        }
+        file->writeLine(");");
+        file->writeLine("return;");
+    }
+    return offset + type->methods.size();
+}
+
+void writeOutMarshaler(std::shared_ptr<Module> targetModule, std::shared_ptr<TypeRef> targetInterface, std::shared_ptr<Module> resultModule, std::optional<bool> enableExceptions, std::string outDir) {
+    std::string suffix = std::string("OutMarshaler");
+    resultModule->name = targetInterface->type->moduleName + "." + targetInterface->type->name + "." + suffix;
+    auto commonModule = TypeCache::parseModule("MicroNetwork.Common");
+    auto idatareceiver = commonModule->findType("IDataReceiver");
+    resultModule->importedTypes.push_back(idatareceiver);
+
+    CppGenerator generator;
+    if (enableExceptions.has_value()) {
+        generator.enableExceptions = enableExceptions.value();
+    }
+
+    auto resultFile = std::static_pointer_cast<CppCodeFile>(generator.createCodeFile());
+
+    resultFile->writeModule(resultModule, false);
+    resultFile->beginNamespaceScope(targetModule->name);
+
+    std::string marshalerName = targetInterface->type->name + suffix;
+
+    resultFile->write("class ").write(marshalerName).write(" : public LFramework::ComImplement<").write(marshalerName).write(", LFramework::ComObject, ").write(resultFile->fullName(targetInterface)).write(">");
+    resultFile->beginScope(marshalerName);
+    resultFile->unident().write("public:").ident().writeLine();
+
+
+    resultFile->write(marshalerName).write("(LFramework::ComPtr<").write(resultFile->fullName(idatareceiver)).write("> next) : _next(next)");
+    resultFile->beginScope("ctor");
+
+    resultFile->endScope();
+
+
+    auto itfType = std::dynamic_pointer_cast<InterfaceType>(targetInterface->type);
+
+    writeOutMethods(itfType, resultFile);
+
+    resultFile->unident().write("protected:").ident().writeLine();
+    resultFile->writeLine("LFramework::ComPtr<MicroNetwork::Common::IDataReceiver> _next;");
+    resultFile->endScope(";");
+    resultFile->endScope();
+
+    generator.saveCodeFile(outDir, resultModule->name, resultFile);
+}
+
+void writeInMarshaler(std::shared_ptr<Module> targetModule, std::shared_ptr<TypeRef> targetInterface, std::shared_ptr<Module> resultModule, std::optional<bool> enableExceptions, std::string outDir) {
+    std::string suffix = std::string("InMarshaler");
+    resultModule->name = targetInterface->type->moduleName + "." + targetInterface->type->name + "." + suffix;
+    auto commonModule = TypeCache::parseModule("MicroNetwork.Common");
+    auto idatareceiver = commonModule->findType("IDataReceiver");
+    resultModule->importedTypes.push_back(idatareceiver);
+
+    CppGenerator generator;
+    if (enableExceptions.has_value()) {
+        generator.enableExceptions = enableExceptions.value();
+    }
+
+    auto resultFile = std::static_pointer_cast<CppCodeFile>(generator.createCodeFile());
+    resultFile->writeModule(resultModule, false);
+    resultFile->beginNamespaceScope(targetModule->name);
+
+    std::string marshalerName = targetInterface->type->name + suffix;
+
+    resultFile->write("class ").write(marshalerName).write(" : public LFramework::ComImplement<").write(marshalerName).write(", LFramework::ComObject, ").write(resultFile->fullName(idatareceiver)).write(">");
+    resultFile->beginScope(marshalerName);
+    resultFile->unident().write("public:").ident().writeLine();
+
+    auto itfType = std::dynamic_pointer_cast<InterfaceType>(targetInterface->type);
+
+    resultFile->write(marshalerName).write("(LFramework::ComPtr<").write(resultFile->fullName(itfType)).write("> next) : _next(next)");
+    resultFile->beginScope("ctor");
+    resultFile->endScope();
+    resultFile->write("void packet(MicroNetwork::Common::PacketHeader header, const void* data)");
+    resultFile->beginScope("packet");
+    resultFile->write("switch (header.id)");
+    resultFile->beginScope("");
+
+    //Write cases
+    writeInMethods(itfType, resultFile);
+
+    resultFile->unident().write("default:").writeLine().ident();
+    resultFile->writeLine("throw LFramework::ComException(LFramework::Result::NotImplemented);");
+    resultFile->endScope();
+    resultFile->endScope();
+    resultFile->unident().write("protected:").ident().writeLine();
+    resultFile->write("LFramework::ComPtr<").write(resultFile->fullName(itfType)).writeLine("> _next; ");
+    resultFile->endScope(";");
+    resultFile->endScope();
+
+    generator.saveCodeFile(outDir, resultModule->name, resultFile);
+}
+
+
+void run(OutputLanguage language, const std::string& outputDir, const std::vector<std::string>& inputDirs, std::optional<bool> enableExceptions, std::string targetInterfaceName, bool isOutMarshaling) {
     TypeCache::init();
     for(auto& dir : inputDirs){
         TypeCache::addSearchPath(dir);
     }
 
     auto targetModuleName = moduleNameFromInterface(targetInterfaceName);
-
     auto shortInterfaceName = targetInterfaceName.substr(targetModuleName.size() + 1);
-
     auto targetModule = TypeCache::parseModule(targetModuleName);
-
-    auto commonModule = TypeCache::parseModule("MicroNetwork.Common");
-
-   /* for (auto& module : modules) {
-        TypeCache::parseModule(module);
-    }*/
-
-    std::string suffix = (isOutMarshaling ? std::string("Out") : std::string("In")) + "Marshaler";
+    auto targetInterface = targetModule->findType(shortInterfaceName);
 
     auto resultModule = std::make_shared<Module>();
-    resultModule->name = targetInterfaceName + "." + suffix;
     resultModule->importedTypes.insert(resultModule->importedTypes.end(), targetModule->importedTypes.begin(), targetModule->importedTypes.end());
-   
-   
-
-    auto parsedModules = TypeCache::getModules();
+    resultModule->importedTypes.push_back(targetInterface);
 
     if(language == OutputLanguage::Cpp){
-        CppGenerator generator;
-        if (enableExceptions.has_value()) {
-            generator.enableExceptions = enableExceptions.value();
+        if (isOutMarshaling) {
+            writeOutMarshaler(targetModule, targetInterface, resultModule, enableExceptions, outputDir);
         }
-      
-
-        auto itf =  targetModule->findType(shortInterfaceName);
-
-        auto idatareceiver = commonModule->findType("IDataReceiver");
-
-        resultModule->importedTypes.push_back(itf);
-        resultModule->importedTypes.push_back(idatareceiver);
-
-        auto codeFile = std::static_pointer_cast<CppCodeFile>( generator.createCodeFile()); 
-        codeFile->writeModule(resultModule, false);
-
-        codeFile->beginNamespaceScope(targetModule->name);
-
-        std::string marshalerName = shortInterfaceName + suffix;
-
-        //: public LFramework::ComImplement<IHostToDeviceMarshaler, LFramework::ComObject, MicroNetwork::Task::MemoryAccess::IHostToDevice> {
-        codeFile->write("class ").write(marshalerName).write(" : public LFramework::ComImplement<").write(marshalerName).write(", LFramework::ComObject, ").write(codeFile->fullName(itf)).write(">");
-        codeFile->beginScope(marshalerName);
-
-
-        codeFile->unident().write("public:").ident().writeLine();
-
-
-        auto itfType = std::dynamic_pointer_cast<InterfaceType>(itf->type);
-        
-        writeOutMethods(itfType, codeFile);
-    
-        codeFile->unident().write("protected:").ident().writeLine();
-        codeFile->writeLine("LFramework::ComPtr<MicroNetwork::Common::IDataReceiver>  _next;");
-        
-
-        codeFile->endScope(";");
-        codeFile->endScope();
-
-        /*
-        class IHostToDeviceMarshaler : public LFramework::ComImplement<IHostToDeviceMarshaler, LFramework::ComObject, MicroNetwork::Task::MemoryAccess::IHostToDevice> {
-public:
-    IHostToDeviceMarshaler(LFramework::ComPtr<MicroNetwork::Common::IDataReceiver> next) : _next(next) {
-        
-    }
-    void read(MicroNetwork::Task::MemoryAccess::MemoryRegion request) {
-        MicroNetwork::Common::PacketHeader header;
-        header.id = 0;
-        header.size = sizeof(MicroNetwork::Task::MemoryAccess::MemoryRegion);
-        _next->packet(header, &request);
-    }
-    void write(MicroNetwork::Task::MemoryAccess::MemoryBlob request) {
-        MicroNetwork::Common::PacketHeader header;
-        header.id = 1;
-        header.size = sizeof(MicroNetwork::Task::MemoryAccess::MemoryBlob);
-        _next->packet(header, &request);
-    }
-protected:
-    LFramework::ComPtr<MicroNetwork::Common::IDataReceiver> _next;
-};
-
-
-*/
-       // codeFile->wr
-
-        generator.saveCodeFile(outputDir, resultModule->name, codeFile);
-       // generator.generate(outputDir);
+        else {
+            writeInMarshaler(targetModule, targetInterface, resultModule, enableExceptions, outputDir);
+        }
     }else{
         throw std::runtime_error("Target language not supported");
     }
@@ -184,7 +209,6 @@ int main(int argc, const char* const* argv) {
         auto language = CommandLine::OptionDescription("--language", "Output files language", CommandLine::OptionType::SingleValue).alias("-l");
         auto outputDir = CommandLine::OptionDescription("--output", "Output files directory", CommandLine::OptionType::SingleValue).alias("-o");
         auto inputDirs = CommandLine::OptionDescription("--input",  "Input files directory", CommandLine::OptionType::MultipleValues).alias("-I");
-
         auto targetInterface = CommandLine::OptionDescription("--target", "IN interface", CommandLine::OptionType::SingleValue);
         auto isOutDirection = CommandLine::OptionDescription("--out", "Is OUT direction marshaling (to network)", CommandLine::OptionType::NoValue);
 
